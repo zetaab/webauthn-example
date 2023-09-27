@@ -4,8 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 
-	"github.com/duo-labs/webauthn/protocol"
-	"github.com/duo-labs/webauthn/webauthn"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 )
 
 // User represents the user model

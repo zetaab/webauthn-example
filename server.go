@@ -2,28 +2,28 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
 	"strings"
 
-	"github.com/duo-labs/webauthn.io/session"
-	"github.com/duo-labs/webauthn/protocol"
-	"github.com/duo-labs/webauthn/webauthn"
-	"github.com/gorilla/mux"
+	common "github.com/elisasre/go-common"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
+	"github.com/gin-contrib/static"
+	"github.com/gin-gonic/gin"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 )
 
 var webAuthn *webauthn.WebAuthn
 var userDB *userdb
-var sessionStore *session.Store
 
 func main() {
 
 	var err error
 	webAuthn, err = webauthn.New(&webauthn.Config{
-		RPDisplayName: "Foobar Corp.",     // Display Name for your site
-		RPID:          "localhost",        // Generally the domain name for your site
-		RPOrigin:      "http://localhost", // The origin URL for WebAuthn requests
+		RPDisplayName: "Foobar Corp.",          // Display Name for your site
+		RPID:          "localhost",             // Generally the domain name for your site
+		RPOrigin:      "http://localhost:8080", // The origin URL for WebAuthn requests
 		// RPIcon: "https://duo.com/logo.png", // Optional icon URL for your site
 	})
 
@@ -33,32 +33,22 @@ func main() {
 
 	userDB = DB()
 
-	sessionStore, err = session.NewStore()
-	if err != nil {
-		log.Fatal("failed to create session store:", err)
-	}
-
-	r := mux.NewRouter()
-
-	r.HandleFunc("/register/begin/{username}", BeginRegistration).Methods("GET")
-	r.HandleFunc("/register/finish/{username}", FinishRegistration).Methods("POST")
-	r.HandleFunc("/login/begin/{username}", BeginLogin).Methods("GET")
-	r.HandleFunc("/login/finish/{username}", FinishLogin).Methods("POST")
-
-	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./")))
-
-	serverAddress := ":8080"
-	log.Println("starting server at", serverAddress)
-	log.Fatal(http.ListenAndServe(serverAddress, r))
+	r := gin.Default()
+	store := cookie.NewStore([]byte("secret"))
+	r.Use(sessions.Sessions("mysession", store))
+	r.GET("/register/begin/:username", BeginRegistration)
+	r.POST("/register/finish/:username", FinishRegistration)
+	r.GET("/login/begin/:username", BeginLogin)
+	r.POST("/login/finish/:username", FinishLogin)
+	r.Use(static.Serve("/", static.LocalFile("./", false)))
+	log.Fatal(r.Run())
 }
 
-func BeginRegistration(w http.ResponseWriter, r *http.Request) {
-
-	// get username/friendly name
-	vars := mux.Vars(r)
-	username, ok := vars["username"]
-	if !ok {
-		jsonResponse(w, fmt.Errorf("must supply a valid username i.e. foo@bar.com"), http.StatusBadRequest)
+func BeginRegistration(c *gin.Context) {
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: "username is empty"})
+		c.Abort()
 		return
 	}
 
@@ -76,143 +66,152 @@ func BeginRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// generate PublicKeyCredentialCreationOptions, session data
-	options, sessionData, err := webAuthn.BeginRegistration(
+	opt, sessionData, err := webAuthn.BeginRegistration(
 		user,
 		registerOptions,
 	)
-
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusInternalServerError)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
-	// store session data as marshaled JSON
-	err = sessionStore.SaveWebauthnSession("registration", sessionData, r, w)
+	session := sessions.Default(c)
+	sessionDataBytes, err := json.Marshal(sessionData)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusInternalServerError)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
-
-	jsonResponse(w, options, http.StatusOK)
+	session.Set("registration", sessionDataBytes)
+	err = session.Save()
+	if err != nil {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
+		return
+	}
+	c.JSON(200, opt)
 }
 
-func FinishRegistration(w http.ResponseWriter, r *http.Request) {
-
-	// get username
-	vars := mux.Vars(r)
-	username := vars["username"]
+func FinishRegistration(c *gin.Context) {
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: "username is empty"})
+		c.Abort()
+		return
+	}
 
 	// get user
 	user, err := userDB.GetUser(username)
 	// user doesn't exist
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
-	// load the session data
-	sessionData, err := sessionStore.GetWebauthnSession("registration", r)
+	session := sessions.Default(c)
+	sessionDataBytes := session.Get("registration")
+	var sessionData webauthn.SessionData
+	// TODO: type assertion check
+	err = json.Unmarshal(sessionDataBytes.([]byte), &sessionData)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
-
-	credential, err := webAuthn.FinishRegistration(user, sessionData, r)
+	credential, err := webAuthn.FinishRegistration(user, sessionData, c.Request)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
 	user.AddCredential(*credential)
-
-	jsonResponse(w, "Registration Success", http.StatusOK)
+	c.String(200, "Registration Success")
 }
 
-func BeginLogin(w http.ResponseWriter, r *http.Request) {
-
-	// get username
-	vars := mux.Vars(r)
-	username := vars["username"]
-
+func BeginLogin(c *gin.Context) {
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: "username is empty"})
+		c.Abort()
+		return
+	}
 	// get user
 	user, err := userDB.GetUser(username)
 
 	// user doesn't exist
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
 	// generate PublicKeyCredentialRequestOptions, session data
 	options, sessionData, err := webAuthn.BeginLogin(user)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusInternalServerError)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
-	// store session data as marshaled JSON
-	err = sessionStore.SaveWebauthnSession("authentication", sessionData, r, w)
+	session := sessions.Default(c)
+	sessionDataBytes, err := json.Marshal(sessionData)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusInternalServerError)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
-
-	jsonResponse(w, options, http.StatusOK)
+	session.Set("authentication", sessionDataBytes)
+	err = session.Save()
+	if err != nil {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
+		return
+	}
+	c.JSON(200, options)
 }
 
-func FinishLogin(w http.ResponseWriter, r *http.Request) {
-
-	// get username
-	vars := mux.Vars(r)
-	username := vars["username"]
+func FinishLogin(c *gin.Context) {
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: "username is empty"})
+		c.Abort()
+		return
+	}
 
 	// get user
 	user, err := userDB.GetUser(username)
 
 	// user doesn't exist
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
-	// load the session data
-	sessionData, err := sessionStore.GetWebauthnSession("authentication", r)
+	session := sessions.Default(c)
+	sessionDataBytes := session.Get("authentication")
+
+	var sessionData webauthn.SessionData
+	// TODO: type assertion check
+	err = json.Unmarshal(sessionDataBytes.([]byte), &sessionData)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
 	// in an actual implementation, we should perform additional checks on
 	// the returned 'credential', i.e. check 'credential.Authenticator.CloneWarning'
 	// and then increment the credentials counter
-	_, err = webAuthn.FinishLogin(user, sessionData, r)
+	_, err = webAuthn.FinishLogin(user, sessionData, c.Request)
 	if err != nil {
-		log.Println(err)
-		jsonResponse(w, err.Error(), http.StatusBadRequest)
+		c.JSON(400, common.ErrorResponse{Code: 400, Message: err.Error()})
+		c.Abort()
 		return
 	}
 
-	// handle successful login
-	jsonResponse(w, "Login Success", http.StatusOK)
-}
-
-// from: https://github.com/duo-labs/webauthn.io/blob/3f03b482d21476f6b9fb82b2bf1458ff61a61d41/server/response.go#L15
-func jsonResponse(w http.ResponseWriter, d interface{}, c int) {
-	dj, err := json.Marshal(d)
-	if err != nil {
-		http.Error(w, "Error creating JSON response", http.StatusInternalServerError)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(c)
-	fmt.Fprintf(w, "%s", dj)
+	c.String(200, "login success %s", user.name)
 }
